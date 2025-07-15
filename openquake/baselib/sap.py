@@ -45,9 +45,12 @@ import os
 import inspect
 import argparse
 import importlib
+from typing import Any, Callable
+from types import ModuleType
 
 NODEFAULT = object()
 
+type FuncDict = dict[str, Callable[..., Any]]
 
 def _choices(choices):
     # returns {choice1, ..., choiceN} or the empty string
@@ -56,8 +59,14 @@ def _choices(choices):
     return ''
 
 
-def _populate(parser, func):
-    # populate the parser
+def _populate(
+    parser: argparse.ArgumentParser,
+    func: Callable[..., Any],
+) -> None:
+    """Populate the (sub)parser with information about `func`.
+    
+    For running, the program assigns the function itself to "_func"
+    """
     # args, varargs, varkw, defaults, kwonlyargs, kwonlydefaults, anns
     argspec = inspect.getfullargspec(func)
     if argspec.varargs:
@@ -129,7 +138,12 @@ def _populate(parser, func):
         parser.add_argument(*args, **kw)
 
 
-def _rec_populate(parser, funcdict):
+def _rec_populate(
+    parser: argparse.ArgumentParser,
+    funcdict: FuncDict,
+) -> None:
+    """Recursively adds subparsers corresponding to each item in FuncDict to the parser."""
+
     subparsers = parser.add_subparsers(
         help='available subcommands; use %s <subcmd> --help' % parser.prog)
     for name, func in funcdict.items():
@@ -140,8 +154,9 @@ def _rec_populate(parser, funcdict):
             _populate(subp, func)
 
 
-def pkg2dic(pkg):
-    """
+def pkg2dic(pkg: ModuleType) -> FuncDict:
+    """Turns a module (with optionally submodules) with `main` functions into FuncDict
+
     :param pkg: a python module or package
     :returns: a dictionary name -> func_or_dic_of_funcs
     """
@@ -164,9 +179,14 @@ def pkg2dic(pkg):
     return dic
 
 
-def parser(funcdict, **kw):
-    """
+def parser(
+    funcdict: Callable[..., Any] | FuncDict | ModuleType,
+    **kw,
+) -> argparse.ArgumentParser:
+    """Creates and populates the parser.
+
     :param funcdict: a function or a nested dictionary of functions
+        or module (with optionally submodules) with `main` functions
     :param kw: keyword arguments passed to the underlying ArgumentParser
     :returns: the ArgumentParser instance
     """
@@ -187,7 +207,15 @@ def parser(funcdict, **kw):
     return parser
 
 
-def _run(parser, argv=None):
+def _run(
+    parser: argparse.ArgumentParser,
+    argv=None
+) -> Any:
+    """Actually do the argument parsing and run the function.
+    
+    If `argv` is None, uses sys.argv[1:]
+    """
+
     namespace = parser.parse_args(argv)
     try:
         func = namespace.__dict__.pop('_func')
@@ -203,9 +231,14 @@ def _run(parser, argv=None):
     return func(**dic)
 
 
-def run(funcdict, argv=None, **parserkw):
+def run(
+    funcdict: Callable[..., Any] | FuncDict | ModuleType,
+    argv=None,
+    **parserkw
+) -> Any:
     """
     :param funcdict: a function or a nested dictionary of functions
+        or module (with optionally submodules) with `main` functions
     :param argv: a list of command-line arguments (if None, use sys.argv[1:])
     :param parserkw: arguments accepted by argparse.ArgumentParser
     """
