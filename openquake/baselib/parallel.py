@@ -201,6 +201,8 @@ from multiprocessing.connection import wait
 import multiprocessing.shared_memory as shmem
 import psutil
 import numpy
+from typing import Literal, Callable, Any, Generator
+from collections.abc import Iterable, Iterator
 
 from openquake.baselib import config, hdf5
 from openquake.baselib.python3compat import decode
@@ -217,6 +219,8 @@ submit = CallableDict()
 MB = 1024 ** 2
 GB = 1024 ** 3
 host_cores = config.zworkers.host_cores.split(',')
+
+type ValidDistribution = Literal['no', 'processpool', 'threadpool', 'zmq', 'slurm']
 
 
 def scratch_dir(job_id):
@@ -259,7 +263,7 @@ def zmq_submit(self, func, args, monitor):
         assert sub == 'submitted', sub
 
 
-def oq_distribute(task=None):
+def oq_distribute(task=None) -> ValidDistribution:
     """
     :returns: the value of OQ_DISTRIBUTE or config.distribution.oq_distribute
     """
@@ -379,7 +383,7 @@ class Result(object):
     """
     func = None
 
-    def __init__(self, val, mon, tb_str='', msg=''):
+    def __init__(self, val, mon: Monitor, tb_str='', msg=''):
         if isinstance(val, dict):
             self.pik = Pickled(val)
             self.nbytes = {k: len(Pickled(v)) for k, v in val.items()}
@@ -419,7 +423,7 @@ class Result(object):
         return '<%s %s>' % (self.__class__.__name__, ' '.join(nbytes))
 
     @classmethod
-    def new(cls, func, args, mon, sentbytes=0):
+    def new(cls, func, args, mon: Monitor, sentbytes=0):
         """
         :returns: a new Result instance
         """
@@ -562,7 +566,7 @@ class IterResult(object):
     :param hdf5path:
         a path where to store persistently the performance info
      """
-    def __init__(self, iresults, taskname, argnames, sent, h5):
+    def __init__(self, iresults: Iterator[Result], taskname: str, argnames, sent, h5):
         self.iresults = iresults
         self.name = taskname
         self.argnames = ' '.join(argnames)
@@ -700,7 +704,9 @@ class Starmap(object):
     expected_outputs = 0  # unknown
 
     @classmethod
-    def init(cls, distribute=None):
+    def init(cls, distribute: ValidDistribution | None = None) -> None:
+        """If distribute == 'processpool' or 'threadpool', instantiate the pool."""
+
         cls.distribute = distribute or oq_distribute()
         if cls.distribute == 'processpool' and not hasattr(cls, 'pool'):
             # unregister custom handlers before starting the processpool
@@ -778,8 +784,13 @@ class Starmap(object):
         return cls.apply(split_task, args, concurrent_tasks or 2*cls.num_cores,
                          maxweight, weight, key, distribute, progress, h5)
 
-    def __init__(self, task_func, task_args=(), distribute=None,
-                 progress=logging.info, h5=None):
+    def __init__(self,
+        task_func: Callable[..., Any],
+        task_args: Iterable[Iterable[Any]] = (),
+        distribute: ValidDistribution | None = None,
+        progress=logging.info,
+        h5: hdf5.File | None = None,
+    ):
         self.__class__.init(distribute=distribute)
         self.task_func = task_func
         if h5:
@@ -821,7 +832,7 @@ class Starmap(object):
         self._shared = {}
         self.n_out = 0
 
-    def log_percent(self):
+    def log_percent(self) -> int:
         """
         Log the progress of the computation in percentage
         """
@@ -851,7 +862,10 @@ class Starmap(object):
 
     def submit(self, args, func=None):
         """
-        Submit the given arguments to the underlying task
+        Submit the given arguments to the underlying task.
+
+        Note: calling this method immediately performs the work, with the result waiting
+        to be requested by e.g. `reduce`.
         """
         func = func or self.task_func
         if not hasattr(self, 'socket'):  # setup the PULL socket the first time
@@ -892,9 +906,13 @@ class Starmap(object):
             (args[0], self.task_func, args[1:], duration, outs_per_task),
             split_task)
 
-    def submit_all(self):
-        """
+    def submit_all(self) -> IterResult:
+        """Submits all arguments in `self.task_args` to `self.task_func`.
+
         :returns: an IterResult object
+
+        Note: unlike `self.submit`, this method does not immediately perform the work.
+        The returned `IterResult` object must be iterated over using e.g. `reduce`.
         """
         if self.num_tasks is None:  # loop on the iterator
             for args in self.task_args:
@@ -951,7 +969,7 @@ class Starmap(object):
             logging.debug('Unlinking %s', name)
             shr.unlink()
 
-    def _loop(self):
+    def _loop(self) -> Generator[Result, None, None]:
         self.busytime = AccumDict(accum=[])  # pid -> time
         dist = 'no' if self.num_tasks == 1 else self.distribute
         if dist == 'slurm':
@@ -974,7 +992,7 @@ class Starmap(object):
         isocket = iter(self.socket)  # read from the PULL socket
         finished = set()
         while self.tasks:
-            res = next(isocket)
+            res: Result = next(isocket)
             self.log_percent()
             if self.calc_id != res.mon.calc_id:
                 logging.warning('Discarding a result from job %s, since this '
