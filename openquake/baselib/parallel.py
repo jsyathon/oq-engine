@@ -259,12 +259,17 @@ def zmq_submit(self, func, args, monitor):
         assert sub == 'submitted', sub
 
 
+@submit.add('processpool_nozmq')
+def ppool_nozmq_submit(self, func, args, monitor):
+    self.pool.apply_async(_safely_call_ppool_nozmq, (func, args, self.task_no, monitor),
+                          callback=self._ppool_nozmq_results)
+
 def oq_distribute(task=None):
     """
     :returns: the value of OQ_DISTRIBUTE or config.distribution.oq_distribute
     """
     dist = os.environ.get('OQ_DISTRIBUTE', config.distribution.oq_distribute)
-    if dist not in ('no', 'processpool', 'threadpool', 'zmq', 'slurm'):
+    if dist not in ('no', 'processpool', 'threadpool', 'zmq', 'slurm', 'processpool_nozmq'):
         raise ValueError('Invalid oq_distribute=%s' % dist)
     return dist
 
@@ -494,6 +499,42 @@ def sendback(res, zsocket):
     return nbytes
 
 
+def _safely_call_ppool_nozmq(func, args, task_no=0, mon=dummy_mon) -> list[Result]:
+    """Alternate implementation of `safely_call` for 'processpool_nozmq'."""
+
+    if hasattr(args[0], 'unpickle'):
+        # args is a list of Pickled objects
+        args = [a.unpickle() for a in args]
+    
+    # debug(f'{mon.backurl=}, {task_no=}')
+    if mon.operation.endswith('_'):
+        name = mon.operation[:-1]
+    elif func is split_task:
+        name = args[1].__name__
+    else:
+        name = func.__name__
+    
+    mon = mon.new(operation='total ' + name, measuremem=True)
+    mon.weight = getattr(args[0], 'weight', 1.)  # used in task_info
+    mon.task_no = task_no
+    if mon.inject:
+        args += (mon,)
+    
+    if inspect.isgeneratorfunction(func):
+        results = []
+        it = func(*args)
+        while True:
+            res = Result.new(next, (it,), mon)
+            # StopIteration -> TASK_ENDED
+            if res.msg == 'TASK_ENDED':
+                break
+            results.append(res)
+        
+        return results
+    else:
+        return [Result.new(func, args, mon)]
+
+
 def safely_call(func, args, task_no=0, mon=dummy_mon):
     """
     Call the given function with the given arguments safely, i.e.
@@ -702,7 +743,7 @@ class Starmap(object):
     @classmethod
     def init(cls, distribute=None):
         cls.distribute = distribute or oq_distribute()
-        if cls.distribute == 'processpool' and not hasattr(cls, 'pool'):
+        if cls.distribute in ('processpool', 'processpool_nozmq') and not hasattr(cls, 'pool'):
             # unregister custom handlers before starting the processpool
             term_handler = signal.signal(signal.SIGTERM, signal.SIG_DFL)
             int_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -823,6 +864,10 @@ class Starmap(object):
         self._shared = {}
         self.n_out = 0
 
+        # This stores the results when using the 'processpool_nozmq' dist
+        if self.distribute == 'processpool_nozmq':
+            self._ppool_res = []
+
     def log_percent(self):
         """
         Log the progress of the computation in percentage
@@ -856,7 +901,9 @@ class Starmap(object):
         Submit the given arguments to the underlying task
         """
         func = func or self.task_func
-        if not hasattr(self, 'socket'):  # setup the PULL socket the first time
+
+        # setup the PULL socket the first time (if not using 'processpool_nozmq')
+        if not hasattr(self, 'socket') and self.distribute != 'processpool_nozmq':  
             self.__class__.running_tasks = self.tasks
             self.socket = Socket(self.receiver, zmq.PULL, 'bind').__enter__()
             self.monitor.shared = self._shared
@@ -916,7 +963,12 @@ class Starmap(object):
         """
         :returns: an :class:`IterResult` instance
         """
-        return IterResult(self._loop(), self.name, self.argnames,
+        if self.distribute == 'processpool_nozmq':
+            iresult = self._loop_ppool_nozmq()
+        else:
+            iresult = self._loop()
+
+        return IterResult(iresult, self.name, self.argnames,
                           self.sent, self.h5)
 
     def reduce(self, agg=operator.add, acc=None):
@@ -936,6 +988,11 @@ class Starmap(object):
                 del self.task_queue[0]
                 self.submit(args, func=func)
 
+    def _ppool_nozmq_results(self, res: list[Result]) -> None:
+        """Append results from the process pool to attrib `_ppool_res`."""
+
+        self._ppool_res.extend(res)
+
     # NB: the shared dictionary will be attached to the monitor
     # and used in the workers; to see an example of usage, look at
     # the event_based calculator
@@ -952,6 +1009,78 @@ class Starmap(object):
         for name, shr in self._shared.items():
             logging.debug('Unlinking %s', name)
             shr.unlink()
+
+    def _loop_ppool_nozmq(self):
+        """Alternate implementation of `_loop` for 'processpool_nozmq'."""
+
+        self.busytime = AccumDict(accum=[])  # pid -> time
+        dist = 'no' if self.num_tasks == 1 else self.distribute
+
+        if self.task_queue:
+            first_args = self.task_queue[:self.CT]
+            self.task_queue[:] = self.task_queue[self.CT:]
+            for func, args in first_args:
+                self.submit(args, func=func)
+
+        if not self.tasks:  # no submit was ever made
+            return ()
+
+        nbytes = sum(self.sent[self.task_func.__name__].values())
+        logging.warning('Sent %d %s tasks, %s', len(self.tasks),
+                        self.name, humansize(nbytes))
+
+        finished = set()
+        while self.tasks:
+            # Wait for `_ppool_res` to fill up
+            if not self._ppool_res:
+                time.sleep(0.1)
+                continue
+
+            res = self._ppool_res.pop(0) # take results in order they arrive
+            self.log_percent()
+            
+            if self.calc_id != res.mon.calc_id:
+                logging.warning('Discarding a result from job %s, since this '
+                                'is job %s', res.mon.calc_id, self.calc_id)
+            elif res.func:  # add subtask
+                self.task_queue.append((res.func, res.pik))
+                self._submit_many(1)
+            else:
+                finished.add(res.mon.task_no)
+                self.busytime += {res.workerid: res.mon.duration}
+                self.tasks.remove(res.mon.task_no)
+                self._submit_many(1)
+                todo = set(range(self.task_no)) - finished
+                logging.debug('%d tasks todo %s', len(todo),
+                              shortlist(sorted(todo)))
+                task_sent = ast.literal_eval(decode(self.h5['task_sent'][()]))
+                task_sent.update(self.sent)
+                del self.h5['task_sent']
+                self.h5['task_sent'] = str(task_sent)
+                name = res.mon.operation[6:]  # strip 'total '
+                n = self.name + ':' + name if name == 'split_task' else name
+                if self._shared:
+                    # do not measure the memory on the workers
+                    # otherwise memory_rss would double count the shared memory
+                    mem_gb = memory_gb()
+                else:
+                    mem_gb = memory_gb(Starmap.pids)
+                res.mon.save_task_info(self.h5, res, n, mem_gb)
+                res.mon.flush(self.h5)
+                self.n_out += 1
+                yield res
+        self.log_percent()
+        self.tasks.clear()
+        self.unlink()
+        if self.expected_outputs:
+            assert self.expected_outputs == self.n_out, (
+                self.expected_outputs, self.n_out)
+        if len(self.busytime) > 1:
+            times = numpy.array(list(self.busytime.values()))
+            logging.info(
+                'Mean time per core=%ds, std=%.1fs, min=%ds, max=%ds',
+                times.mean(), times.std(), times.min(), times.max())
+
 
     def _loop(self):
         self.busytime = AccumDict(accum=[])  # pid -> time
