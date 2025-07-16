@@ -264,6 +264,11 @@ def ppool_nozmq_submit(self, func, args, monitor):
     self.pool.apply_async(_safely_call_ppool_nozmq, (func, args, self.task_no, monitor),
                           callback=self._ppool_nozmq_results)
 
+@submit.add('_no_nozmq')
+def _no_nozmq_submit(self, func, args, monitor):
+    # dist '_no_nozmq' not to be used directly!
+    self._ppool_nozmq_results(_safely_call_ppool_nozmq(func, args, self.task_no, monitor))
+
 def oq_distribute(task=None):
     """
     :returns: the value of OQ_DISTRIBUTE or config.distribution.oq_distribute
@@ -520,19 +525,29 @@ def _safely_call_ppool_nozmq(func, args, task_no=0, mon=dummy_mon) -> list[Resul
     if mon.inject:
         args += (mon,)
     
+    # We mimic the API as much as possible here, including putting a 'TASK_ENDED' dummy
+    # Result at the end of each list.  If we don't, there are problems with tasks that
+    # call subfunctions never being deleted.
     if inspect.isgeneratorfunction(func):
         results = []
+        sentbytes = 0
         it = func(*args)
         while True:
-            res = Result.new(next, (it,), mon)
+            res = Result.new(next, (it,), mon, sentbytes)
+            results.append(res)
+
             # StopIteration -> TASK_ENDED
             if res.msg == 'TASK_ENDED':
                 break
-            results.append(res)
+
+            sentbytes += len(res.pik)
         
         return results
     else:
-        return [Result.new(func, args, mon)]
+        res = Result.new(func, args, mon)
+        end = Result(None, mon, msg='TASK_ENDED')
+        end.pik = FakePickle(len(res.pik))
+        return [res, end]
 
 
 def safely_call(func, args, task_no=0, mon=dummy_mon):
@@ -906,17 +921,30 @@ class Starmap(object):
         if not hasattr(self, 'socket') and self.distribute != 'processpool_nozmq':  
             self.__class__.running_tasks = self.tasks
             self.socket = Socket(self.receiver, zmq.PULL, 'bind').__enter__()
-            self.monitor.shared = self._shared
             self.monitor.backurl = 'tcp://%s:%s' % (
                 self.return_ip, self.socket.port)
             if self.distribute == 'slurm':
                 self.init_slurm()
+        
+        # Add shared array attribute to Monitor
+        if not hasattr(self.monitor, 'shared'):
+            self.monitor.shared = self._shared
+
         OQ_TASK_NO = os.environ.get('OQ_TASK_NO')
         if OQ_TASK_NO is not None and self.task_no != int(OQ_TASK_NO):
             self.task_no += 1
             return
-        dist = 'no' if self.num_tasks == 1 or OQ_TASK_NO else self.distribute
-        if dist != 'no':
+        
+        # For a single task don't parallelize
+        if self.num_tasks == 1 or OQ_TASK_NO:
+            if self.distribute == 'processpool_nozmq':
+                dist = '_no_nozmq'
+            else:
+                dist = 'no'
+        else:
+            dist = self.distribute
+        
+        if dist not in ('no', '_no_nozmq'):
             pickled = isinstance(args[0], Pickled)
             if not pickled:
                 assert not isinstance(args[-1], Monitor)  # sanity check
@@ -1042,10 +1070,7 @@ class Starmap(object):
             if self.calc_id != res.mon.calc_id:
                 logging.warning('Discarding a result from job %s, since this '
                                 'is job %s', res.mon.calc_id, self.calc_id)
-            elif res.func:  # add subtask
-                self.task_queue.append((res.func, res.pik))
-                self._submit_many(1)
-            else:
+            elif res.msg == 'TASK_ENDED':
                 finished.add(res.mon.task_no)
                 self.busytime += {res.workerid: res.mon.duration}
                 self.tasks.remove(res.mon.task_no)
@@ -1067,6 +1092,10 @@ class Starmap(object):
                     mem_gb = memory_gb(Starmap.pids)
                 res.mon.save_task_info(self.h5, res, n, mem_gb)
                 res.mon.flush(self.h5)
+            elif res.func:  # add subtask
+                self.task_queue.append((res.func, res.pik))
+                self._submit_many(1)
+            else:
                 self.n_out += 1
                 yield res
         self.log_percent()
