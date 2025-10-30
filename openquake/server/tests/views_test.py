@@ -16,23 +16,34 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
-import io
 import os
 import sys
 import json
 import time
-import numpy
-
+import string
+import secrets
 import django
+from django.contrib.auth import get_user_model
 from openquake.baselib.general import gettemp
+from openquake.commonlib.readinput import loadnpz
 
 
-def loadnpz(lines):
-    if hasattr(lines, 'content'):
-        # there was an error and we got an HTTP response from Django
-        raise RuntimeError(lines.content.decode('utf-8'))
-    bio = io.BytesIO(b''.join(ln for ln in lines))
-    return numpy.load(bio)
+def get_or_create_user(level):
+    # creating/getting a user of the given level
+    # and returning the user object and its plain password
+    User = get_user_model()
+    username = f'django-test-user-level-{level}'
+    email = f'django-test-user-level-{level}@email.test'
+    password = ''.join((secrets.choice(
+        string.ascii_letters + string.digits + string.punctuation)
+        for i in range(8)))
+    user, created = User.objects.get_or_create(username=username, email=email)
+    if created:
+        user.set_password(password)
+    user.save()
+    user.profile.level = level
+    user.profile.save()
+    return user, password  # user.password is the hashed password instead
 
 
 class EngineServerTestCase(django.test.TestCase):
