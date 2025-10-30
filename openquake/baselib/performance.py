@@ -28,6 +28,7 @@ import operator
 import itertools
 import subprocess
 import collections
+import tracemalloc
 from datetime import datetime
 from contextlib import contextmanager
 from decorator import decorator
@@ -509,9 +510,10 @@ def get_slices(uint32s):
     :param uint32s: a sequence of uint32 integers (with repetitions)
     :returns: a dict integer -> [(start, stop), ...]
 
-    >>> from pprint import pprint
-    >>> pprint(get_slices(numpy.uint32([0, 0, 3, 3, 3, 2, 2, 0])))
-    {0: [(0, 2), (7, 8)], 2: [(5, 7)], 3: [(2, 5)]}
+    >>> slices = get_slices(numpy.uint32([0, 0, 3, 3, 3, 2, 2, 0]))
+    >>> slices
+    {0: array([[0, 2],
+           [7, 8]]), 3: array([[2, 5]]), 2: array([[5, 7]])}
     """
     if len(uint32s) == 0:
         return {}
@@ -520,7 +522,7 @@ def get_slices(uint32s):
         if idx not in indices:
             indices[idx] = []
         indices[idx].append((start, stop))
-    return indices
+    return {int(i): numpy.array(indices[i]) for i in indices}
 
 
 # this is used in split_array and it may dominate the performance
@@ -597,3 +599,15 @@ def kollapse(array, kfields, kround=kround0, mfields=(), afield=''):
     if afield:
         return res, split_array(array[afield], indices, counts)
     return res
+
+
+@contextmanager
+def monitor_alloc():
+    tracemalloc.start()
+    snap1 = tracemalloc.take_snapshot()
+    yield
+    snap2 = tracemalloc.take_snapshot()
+    top_stats = snap2.compare_to(snap1, 'lineno')
+    print("Top 10 memory differences:")
+    for stat in top_stats[:10]:
+        print(stat)

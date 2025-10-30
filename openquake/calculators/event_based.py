@@ -105,8 +105,6 @@ def build_hcurves(dstore):
         min_ = gmf_df[sec_imt].min() + 1E-10  # to ensure min_ > 0
         max_ = gmf_df[sec_imt].max() + 2E-10  # to ensure max_ > min_
         imtls[sec_imt] = valid.logscale(min_, max_, L1)
-    dstore['all_imtls'] = imtls
-    dstore['all_imtls'].attrs['imts'] = ' '.join(imtls)
     hc_mon = performance.Monitor('building hazard curves', measuremem=False,
                                  h5=dstore)
     hcurves = {}
@@ -383,6 +381,7 @@ def starmap_from_rups(func, oq, full_lt, sitecol, dstore, save_tmp=None):
                    oq.maximum_distance['default'][-1][1])
         station_data, station_sites = filter_stations(
             station_df, sitecol.complete, rup, maxdist)
+        dstore['stations_considered'] = station_sites if station_sites else []
     else:
         station_data, station_sites = None, None
 
@@ -702,9 +701,9 @@ class EventBasedCalculator(base.HazardCalculator):
             [(trt_smr, rlzs_by_gsim)] = gsim_lt.get_rlzs_by_gsim_dic().items()
             trt = trts[trt_smr // TWO24]
             rup = readinput.get_rupture(oq)
-            # If the hypocenter is outside the rupture surface, relocate it to the
-            # middle of the surface (in case, it logs a warning indicating the original
-            # and the translated coordinates)
+            # If the hypocenter is outside the rupture surface, relocate it
+            # to the middle of the surface (in case, it logs a warning
+            # indicating the original and the translated coordinates)
             rup, _warn = adjust_hypocenter(rup)
             oq.mags_by_trt = {trt: [magstr(rup.mag)]}
             self.cmaker = ContextMaker(trt, rlzs_by_gsim, oq)
@@ -750,17 +749,26 @@ class EventBasedCalculator(base.HazardCalculator):
 
     def execute(self):
         oq = self.oqparam
+        dstore = self.datastore
         if oq.impact and oq.shakemap_uri:
-            # this is creating gmf_data
+            # when calling `oqi usgs_id`
             base.store_gmfs_from_shakemap(self, self.sitecol, self.assetcol)
             return {}
-        dstore = self.datastore
-        E = None
+        elif 'gmf_data' in dstore:
+            # already computed
+            return {}
+        E = getattr(oq, 'number_of_ground_motion_fields', None)
         if oq.ground_motion_fields and oq.min_iml.sum() == 0:
             logging.warning('The GMFs are not filtered: '
                             'you may want to set a minimum_intensity')
         elif oq.minimum_intensity:
             logging.info('minimum_intensity=%s', oq.minimum_intensity)
+            sec_imts = {sec.split('_')[1] for sec in oq.sec_imts} & set(
+                oq.minimum_intensity)
+            if sec_imts:
+                logging.warning(
+                    f'Discarding GMFs associated to low {sec_imts=}'
+                    ' i.e. getting wrong seismic risk')
         else:
             logging.info('min_iml=%s', oq.min_iml)
         self.offset = 0
@@ -774,7 +782,11 @@ class EventBasedCalculator(base.HazardCalculator):
             if (oq.ground_motion_fields is False and
                     oq.hazard_curves_from_gmfs is False):
                 return {}
-        elif not oq.rupture_dict and 'rupture_model' not in oq.inputs:
+        elif 'grid_url' in oq.shakemap_uri:
+            base.store_gmfs_from_shakemap(self, self.sitecol, self.assetcol)
+            return {}
+        elif (not oq.rupture_dict and not oq.shakemap_uri
+              and 'rupture_model' not in oq.inputs):
             logging.warning(
                 'There is no rupture_model, the calculator will just '
                 'import data without performing any calculation')
@@ -786,12 +798,14 @@ class EventBasedCalculator(base.HazardCalculator):
             with hdf5.File(oq.ruptures_hdf5) as r:
                 E = len(r['events'])
         else:  # scenario
-            self._read_scenario_ruptures()
+            if 'rupture_model' in oq.inputs or oq.rupture_dict:
+                self._read_scenario_ruptures()
             if (oq.ground_motion_fields is False and
                     oq.hazard_curves_from_gmfs is False):
                 return {}
 
-        if oq.ground_motion_fields:
+        if oq.ground_motion_fields and 'gmf_data' not in dstore:
+            # if GMFs not already created by store_gmfs_from_shakemap
             prim_imts = oq.get_primary_imtls()
             base.create_gmf_data(dstore, prim_imts, oq.sec_imts,
                                  E=E, R=oq.number_of_logic_tree_samples)

@@ -120,22 +120,22 @@ def reagg_idxs(num_tags, tagnames):
 
     For instance reaggregating by taxonomy and region would give:
 
-    >>> list(reagg_idxs(num_tags, ['taxonomy', 'region']))  # 4x3
+    >>> [int(x) for x in reagg_idxs(num_tags, ['taxonomy', 'region'])]  # 4x3
     [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11]
 
     Reaggregating by taxonomy and country would give:
 
-    >>> list(reagg_idxs(num_tags, ['taxonomy', 'country']))  # 4x2
+    >>> [int(x) for x in reagg_idxs(num_tags, ['taxonomy', 'country'])]  # 4x2
     [0, 1, 0, 1, 0, 1, 2, 3, 2, 3, 2, 3, 4, 5, 4, 5, 4, 5, 6, 7, 6, 7, 6, 7]
 
     Reaggregating by region and country would give:
 
-    >>> list(reagg_idxs(num_tags, ['region', 'country']))  # 3x2
+    >>> [int(x) for x in  reagg_idxs(num_tags, ['region', 'country'])]  # 3x2
     [0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5]
 
     Here is an example of single tag aggregation:
 
-    >>> list(reagg_idxs(num_tags, ['taxonomy']))  # 4
+    >>> [int(x) for x in reagg_idxs(num_tags, ['taxonomy'])]  # 4
     [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3]
     """
     shape = list(num_tags.values())
@@ -349,7 +349,7 @@ def compute_aggrisk(dstore, oq, rbe_df, num_events, agg_ids):
                 if oq.quantiles and not col.startswith('dmg_'):
                     ls, ws = quantiles[agg_id, loss_id]
                     ls.extend(sorted_losses)
-                    ws.extend([weights[rlz_id]]* len(sorted_losses))
+                    ws.extend([weights[rlz_id]] * len(sorted_losses))
                 agg = sorted_losses.sum()
                 acc[col].append(
                     agg * tr if oq.investigation_time else agg/ne)
@@ -371,7 +371,7 @@ def compute_aggrisk(dstore, oq, rbe_df, num_events, agg_ids):
     aggrisk_quantiles = pandas.DataFrame(out)
     return aggrisk, aggrisk_quantiles, columns, builder
 
-    
+
 # aggcurves are built in parallel, aggrisk sequentially
 def build_store_agg(dstore, oq, rbe_df, num_events):
     """
